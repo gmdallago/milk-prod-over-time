@@ -1,0 +1,610 @@
+# Análises TCC do Pedro Sampaio
+# Objetivo: Avaliar a série temporal de produção de leite em vacas da raça Holandesa
+
+
+# Loading packages
+extrafont::loadfonts(device = "win")
+
+require(tidyverse)
+require(tidylog)
+require(DataExplorer)
+require(nlme)
+library(emmeans)
+
+
+# Data ####
+
+hol1 <- read.csv(
+  "~/complete_lactations.csv",
+  header= T,
+  sep= ";",
+  dec= ",",
+  na.strings = c("NA", "?", "")) %>% 
+  rename("Raca" = "Raça")
+
+names(hol1) <- tolower(names(hol1))
+
+
+# Cleaning ####
+
+# Formatando as datas
+hol1$data.nascimento <- as.Date(hol1$data.nascimento, format= "%d/%m/%y")
+hol1$data.parto <- as.Date(hol1$data.parto, format= "%d/%m/%y")
+hol1$datamorte <- as.Date(hol1$datamorte, format= "%d/%m/%y")
+
+
+
+# Criando variável estação do ano do parto
+get.season <- function(DATES) {
+  WS <- as.Date("2016-12-21", format = "%Y-%m-%d") # Summer
+  SE <- as.Date("2016-3-20",  format = "%Y-%m-%d") # Fall
+  SS <- as.Date("2016-6-20",  format = "%Y-%m-%d") # Winter
+  FE <- as.Date("2016-9-22",  format = "%Y-%m-%d") # Spring
+  
+  # Convert dates from any year to 2016 dates (Leap year)
+  d <- as.Date(strftime(DATES, format="2016-%m-%d"))
+  
+  as.factor(ifelse (d >= WS | d < SE, "Verao",
+                    ifelse (d >= SE & d < SS, "Outono",
+                            ifelse (d >= SS & d < FE, "Inverno", "Primavera"))))
+}
+
+
+hol1$estacao.parto <- get.season(hol1$data.parto)
+
+# Criando variável ano do parto
+hol1$ano.parto <- lubridate::year(hol1$data.parto)
+
+
+# Criando variável idade do parto em meses
+
+# turn a date into a 'monthnumber' relative to an origin
+monnb <- function(d) {
+  lt <- as.POSIXlt(as.Date(d, origin="1900-01-01"))
+  lt$year*12 + lt$mon
+} 
+
+# compute a month difference as a difference between two months
+mondf <- function(d1, d2) {
+  monnb(d1) - monnb(d2)
+}
+
+
+hol1$idade.parto <- mondf(d2 = hol1$data.nascimento, d1 = hol1$data.parto)
+
+
+# Variável ordem do parto tem varias inconsistências, tentando corrigir pelo menos a maioria delas
+
+hol2 <- hol1 %>%
+  arrange(id.animal, idade.parto) %>%
+  group_by(id.animal) %>%
+  mutate(ordem.parto.ok = ifelse(is.na(lag(ordem.parto)) == TRUE, #| status.do.nascimento.da.cria == "ABORTO",
+                                 ordem.parto,
+                                 ifelse((abs(idade.parto) - abs(lag(idade.parto))) < 28 & (ordem.parto - lag(ordem.parto)) != 1,
+                                        NA, ordem.parto))) %>% 
+  mutate(ordem.parto.ok = ifelse(is.na(ordem.parto.ok) == TRUE,
+                                 lag(ordem.parto.ok)+1, ordem.parto.ok)) %>%
+  mutate(ordem.parto.ok = ifelse(is.na(ordem.parto.ok) == TRUE,
+                                 lag(ordem.parto.ok)+1, ordem.parto.ok)) %>%
+  mutate(ordem.parto.ok = ifelse(is.na(ordem.parto.ok) == TRUE,
+                                 lag(ordem.parto.ok)+1, ordem.parto.ok)) %>%
+  mutate(ordem.parto.ok = ifelse(is.na(ordem.parto.ok) == TRUE,
+                                 lag(ordem.parto.ok)+1, ordem.parto.ok)) %>%
+  mutate(ordem.parto.ok = ifelse(is.na(ordem.parto.ok) == TRUE,
+                                 lag(ordem.parto.ok)+1, ordem.parto.ok)) %>%
+  ungroup()
+
+
+# A maioria das inconsistências foram corrigidas!!! :D :D :D
+
+
+# Dados descritivos iniciais para o Material e Métodos
+hol2 %>% 
+  filter(raca == "HOLANDES") %>% 
+  count()
+  
+  
+hol2 %>% 
+  filter(raca == "HOLANDES") %>% 
+  summarise(animal = n_distinct(id.animal),
+            herd = n_distinct(cliente))
+
+hol2 %>% 
+  filter(raca == "HOLANDES") %>% 
+  select(data.parto) %>% 
+  summary()
+
+
+# Preparação dos dados
+
+hol3 <- hol2 %>%
+  
+  
+  # Mantendo somente observações de animais da raça Holandesa
+  filter(raca == "HOLANDES") %>% 
+  
+  
+  # Removendo entradas duplicadas com base no ID Animal, ano e estação do parto (ordem do parto não é 100%)
+  distinct(id.animal, ano.parto, estacao.parto, .keep_all = TRUE) %>% 
+  
+  # Removing observação onde a idade do parto está fora dos intervalos estabelecidos
+  mutate(remove = ifelse(ordem.parto.ok == 1 & !(idade.parto %in% c(20:40)), "yes",
+                         ifelse(ordem.parto.ok == 2 & !(idade.parto %in% c(29:60)), "yes",
+                                ifelse(ordem.parto.ok == 3 & !(idade.parto %in% c(38:70)), "yes",
+                                       ifelse(ordem.parto.ok == 4 & !(idade.parto %in% c(47:90)), "yes", 
+                                              ifelse(ordem.parto.ok == 5 & !(idade.parto %in% c(60:100)), "yes",
+                                                     ifelse(ordem.parto.ok > 5 & !(idade.parto %in% c(70:120)), "yes","no")
+                                              )))))) %>% 
+  filter(remove == "no") %>% 
+  
+  # Agrupando paridades maiores ou iguais que 5
+  mutate(ordem.parto.stats = factor(ifelse(ordem.parto > 5,
+                                           "6+", ordem.parto),
+                                    levels = c("1", "2", "3", "4", "5", "6+"))) %>%
+  
+  # Mantendo apenas lactações de no máximo 500 dias
+  filter(diaslactacao %in% c(1:500)) %>% 
+  
+  # Removendo NAs and Zeros produção de leite
+  filter(!is.na(prodleite305dias),
+         prodleite305dias !=0) %>% 
+  
+  # Getting month of calving
+  mutate(mes.parto = lubridate::month(data.parto))
+
+  
+  # # Identificando e removendo outliers
+  # filter(prodleite305dias >= quantile(prodleite305dias, 0.01),
+  #        prodleite305dias <= quantile(prodleite305dias, 0.99))
+  
+  
+# Keeping only observations from years that have calving on every month
+
+year.keep <- hol3 %>% 
+  distinct(ano.parto, mes.parto, .keep_all = FALSE) %>% 
+  group_by(ano.parto) %>% 
+  add_count() %>% 
+  ungroup() %>% 
+  filter(n >= 12) %>% 
+  distinct(ano.parto) %>% 
+  pull(ano.parto)
+
+
+hol4 <- hol3 %>% 
+  filter(ano.parto %in% year.keep) %>% 
+  
+  
+  # Keeping herds with at least 10 observations for the random effect
+  group_by(cliente) %>%
+  mutate(n_obs = n()) %>%
+  ungroup() %>% 
+  filter(n_obs >= 10) %>% 
+  
+  
+  # Creating position variable to evaluate correlation structures
+  # The position variable defines the indices of the correlation parameters
+  # for each observation and must evaluate to an integer vector, 
+  # with nonrepeated values per group, such that its unique values, when sorted,
+  # form a sequence of consecutive integers
+  # 
+  # Cliente is the group (random effect) evaluated in this study
+  arrange(ano.parto, mes.parto, cliente, ordem.parto.ok, data.parto) %>% 
+  group_by(cliente) %>% 
+  mutate(timePos = row_number()) %>% 
+  ungroup()
+
+
+
+
+# Análise exploratória ####
+# Dados descritivos sobre o arquivo que foi analisado
+
+hol4 %>% 
+  count()
+
+hol4 %>% 
+  summarise(animal = n_distinct(id.animal),
+            herd = n_distinct(cliente))
+
+hol4 %>% 
+  select(ano.parto) %>% 
+  summary()
+
+
+hol4 %>% 
+  summarise(AVG = mean(prodleite305dias),
+            SD = sd(prodleite305dias),
+            MIN = min(prodleite305dias),
+            MAX = max(prodleite305dias)) %>% 
+  as.data.frame() %>% 
+  round(2)
+
+
+
+
+ggplot(hol4, 
+       aes(x = prodleite305dias)) +
+  geom_histogram()
+
+
+ggplot(hol4, 
+       aes(x = prodleite305dias)) +
+  facet_wrap(~ ano.parto,
+             scales = "free") +
+  geom_histogram()
+
+
+
+
+ggplot(hol4, 
+       aes(x = prodleite305dias)) +
+  facet_wrap(~ mes.parto) +
+  geom_histogram()
+
+set.seed(1801)
+ggplot(hol4 %>%
+         mutate(ano.parto = as.factor(ano.parto),
+                mes.parto = as.factor(mes.parto)) %>% 
+         filter(cliente %in% sample(unique(cliente),5)), 
+       aes(y = prodleite305dias,
+           x = mes.parto,
+           color = cliente)) +
+  geom_boxplot(show.legend = FALSE)
+
+
+set.seed(1801)
+ggplot(hol4 %>% 
+         filter(cliente %in% sample(unique(cliente),5)), 
+       aes(y = prodleite305dias,
+           x = estacao.parto,
+           color = cliente)) +
+  geom_boxplot(show.legend = FALSE)
+
+
+
+# Modeling ####
+
+options(contrasts = c("contr.sum", "contr.poly"))
+model.leite1 <- lme(prodleite305dias ~ diaslactacao + I(diaslactacao^2) +
+                      numeroordenhas + ordem.parto.stats + ano.parto + mes.parto,
+                    random = ~ 1|cliente,
+                    control = lmeControl(opt = "optim"),
+                    data = hol4 %>%
+                      mutate(ano.parto = as.factor(ano.parto),
+                             mes.parto = as.factor(mes.parto)))
+
+
+# Testando estruturas de correlação uma vez que as observações foram coletadas ao longo do tempo
+options(contrasts = c("contr.sum", "contr.poly"))
+
+
+# model.leite1.gencor <- lme(prodleite305dias ~ diaslactacao + I(diaslactacao^2) +
+#                              numeroordenhas + ordem.parto.stats + ano.parto + mes.parto,
+#                            random = ~ 1|cliente,
+#                            control = lmeControl(opt = "optim"),
+#                            data = hol4 %>%
+#                              mutate(ano.parto = as.factor(ano.parto),
+#                                     mes.parto = as.factor(mes.parto)),
+#                            correlation = corSymm(form = ~ timePos))
+# # Not enough computer power for General correlation structure
+
+
+model.leite1.ar1cor <- lme(prodleite305dias ~ diaslactacao + I(diaslactacao^2) +
+                             numeroordenhas + ordem.parto.stats + ano.parto + mes.parto,
+                           random = ~ 1|cliente,
+                           control = lmeControl(opt = "optim"),
+                           data = hol4 %>%
+                             mutate(ano.parto = as.factor(ano.parto),
+                                    mes.parto = as.factor(mes.parto)),
+                           correlation = corAR1(form = ~ timePos))
+
+
+model.leite1.CompSymcor <- lme(prodleite305dias ~ diaslactacao + I(diaslactacao^2) +
+                                 numeroordenhas + ordem.parto.stats + ano.parto + mes.parto,
+                               random = ~ 1|cliente,
+                               control = lmeControl(opt = "optim"),
+                               data = hol4 %>%
+                                 mutate(ano.parto = as.factor(ano.parto),
+                                        mes.parto = as.factor(mes.parto)),
+                               correlation = corCompSymm())
+
+
+# Avaliando os modelos
+anova(model.leite1,
+      model.leite1.ar1cor,
+      model.leite1.CompSymcor,
+      test = FALSE)
+
+
+# Modelo com autocorrelação de level 1 foi o melhor
+
+## Análise dos resíduos ####
+
+# Assumption 1: Within-group errors are independent, follow a normal distribution ~ N(0, Ï2), 
+# and are independent of random effects
+
+
+# Errors should be centered at zero in the following plot
+plot(model.leite1.ar1cor, cliente ~ resid(.), abline = 0)
+
+
+# Looking at the variance between fixed effects
+plot(model.leite1.ar1cor, resid(., type = "p") ~ fitted(.) | numeroordenhas,
+     id = NULL, adj = -0.3)
+
+plot(model.leite1.ar1cor, resid(., type = "p") ~ fitted(.) | ordem.parto.stats,
+     id = NULL, adj = -0.3)
+
+plot(model.leite1.ar1cor, resid(., type = "p") ~ fitted(.) | ano.parto,
+     id = NULL, adj = -0.3)
+
+plot(model.leite1.ar1cor, resid(., type = "p") ~ fitted(.) | mes.parto,
+     id = NULL, adj = -0.3)
+
+
+# Checking if the residuals follow a normal distribution
+car::qqPlot(resid(model.leite1.ar1cor, type = "pearson"))
+
+
+# Evaluating within-group heteroscedasticity and independence
+plot(model.leite1.ar1cor)
+
+
+# Assumption 2: Random effects are normally distributed ~ N (0, sigma2) and
+# are independent for different groups
+
+car::qqPlot(ranef(model.leite1.ar1cor, level = 1)$"(Intercept)",
+            main = "Rebanho")
+
+# Independence
+plot(ranef(model.leite1.ar1cor, level = 1)$"(Intercept)")
+abline(h = 0,
+       col = "red")
+
+
+# Assumptions were mostly met. There is a little departure from normality, but
+# it should not be a big problem
+
+# Getting significance of the fixed effects
+anova(model.leite1.ar1cor, type = "marginal")
+
+anova(model.leite1.ar1cor, type = "marginal")$"p-value" %>% 
+  round(2)
+
+summary(model.leite1.ar1cor)
+caret::R2(obs = hol4$prodleite305dias,
+          pred = predict(model.leite1.ar1cor, hol4 %>%
+                           mutate(ano.parto = as.factor(ano.parto),
+                                  mes.parto = as.factor(mes.parto)))) %>%
+  round(2)
+
+caret::MAE(obs = hol4$prodleite305dias,
+          pred = predict(model.leite1.ar1cor, hol4 %>%
+                           mutate(ano.parto = as.factor(ano.parto),
+                                  mes.parto = as.factor(mes.parto)))) %>%
+  round(2)
+
+
+## Extraíndo resultados ####
+
+
+# Ano
+# Médias marginais
+emmeans(model.leite1.ar1cor, ~ ano.parto)
+
+
+# Avaliando tendência
+contrast(emmeans(model.leite1.ar1cor, pairwise ~ ano.parto)[[1]], 
+         "poly")
+
+
+# Regressão linear usando as médias marginais
+ano.milk.lm <- lm(emmean ~ ano.parto,
+                 data = emmeans(model.leite1.ar1cor, ~ ano.parto) %>% 
+                   as.data.frame() %>% 
+                   mutate(ano.parto = as.numeric(ano.parto)))
+
+summary(ano.milk.lm)
+
+
+model.res <- data.frame(model = paste("hat(Y) ==", 
+                                      format(round(coef(ano.milk.lm)[1], digits = 2), nsmall = 2), " + ",
+                                      format(round(coef(ano.milk.lm)[2], digits = 2),nsmall = 2), "~'x'",
+                                      sep = ""),
+                        r2 = paste("italic(R^2) ==", format(round(summary(ano.milk.lm)$adj.r.squared, 2), digits = 2),
+                                   sep = ""),
+                        p_valor = paste("~' '~", 
+                                        "~italic(P-valor) ", "< 0.001",
+                                        sep = ""))
+
+
+
+ggplot(emmeans(model.leite1.ar1cor, ~ ano.parto) %>% 
+         as.data.frame(),
+       aes(x = as.numeric(as.character(ano.parto)),
+           y = emmean)) +
+  geom_errorbar(aes(ymin = lower.CL,
+                    ymax = upper.CL),
+                width = 0.25, size = 0.25, color = "gray33") +
+  geom_point(size = 2.5, show.legend = FALSE,
+             color = "black") +
+  geom_smooth(method = "lm", se = TRUE,
+              formula =  'y ~ x',
+              size = 0.5) +
+  scale_y_continuous(limits = c(6500, 8900),
+                     breaks = seq(6500, 8900, 300),
+                     expand = expansion(mult = 0, add = 0)) +
+  scale_x_continuous(breaks = seq(1996, 2016, 2)) +
+  theme_classic(base_family = "Times New Roman") +
+  labs(x = "Ano",
+       y = "Produção de leite (Kg/animal/lactação)") + 
+  geom_text(data = model.res,
+            mapping = aes(x = 2000, y = Inf,
+                          label = model),
+            vjust = +1,
+            family = "Times New Roman",
+            parse = TRUE) +
+  geom_text(data = model.res,
+            mapping = aes(x = 2000, y = Inf,
+                          label = paste(r2, p_valor)),
+            vjust = +2.5,
+            family = "Times New Roman",
+            parse = TRUE) +
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.title.x = element_text(size = 10,
+                                    margin = margin(t = 5, # top
+                                                    r = 0, # right 
+                                                    b = 0, # bottom
+                                                    l = 0)),
+        axis.title.y = element_text(size = 10,
+                                    margin = margin(t = 0, # top
+                                                    r = 10, # right 
+                                                    b = 0, # bottom
+                                                    l = 0)))
+
+ggsave(filename = paste(Sys.Date(), "Ano.jpeg", sep = "_"),
+       units = "cm",
+       width = 15,
+       height = 9,
+       dpi = 700)
+
+
+# Mês
+# Médias marginais
+emmeans(model.leite1.ar1cor, ~ mes.parto)
+
+
+# Avaliando tendência
+contrast(emmeans(model.leite1.ar1cor, pairwise ~ mes.parto)[[1]], 
+         "poly")
+
+
+# Regressão linear usando as médias marginais
+mes.milk.lm <- lm(emmean ~ mes.parto + I(mes.parto^2),
+                  data = emmeans(model.leite1.ar1cor, ~ mes.parto) %>% 
+                    as.data.frame() %>% 
+                    mutate(mes.parto = as.numeric(mes.parto)))
+
+summary(mes.milk.lm)
+
+
+model.mes.res <- data.frame(model = paste("hat(Y) ==", 
+                                      format(round(coef(mes.milk.lm)[1], digits = 2), nsmall = 2), " + ",
+                                      format(round(coef(mes.milk.lm)[2], digits = 2),nsmall = 2), "~'x'",
+                                      format(round(coef(mes.milk.lm)[3], digits = 2),nsmall = 2), "~'x'^2",
+                                      sep = ""),
+                        r2 = paste("italic(R^2) ==", format(round(summary(mes.milk.lm)$adj.r.squared, 2), digits = 2),
+                                   sep = ""),
+                        p_valor = paste("~' '~", 
+                                        "~italic(P-valor) ==",
+                                        signif(pf(summary(mes.milk.lm)$fstatistic[1], 
+                                                  summary(mes.milk.lm)$fstatistic[2], 
+                                                  summary(mes.milk.lm)$fstatistic[3], 
+                                                  lower.tail=FALSE),1),
+                                        sep = ""))
+
+
+
+ggplot(emmeans(model.leite1.ar1cor, ~ mes.parto) %>% 
+         as.data.frame(),
+       aes(x = as.numeric(as.character(mes.parto)),
+           y = emmean)) +
+  geom_errorbar(aes(ymin = lower.CL,
+                    ymax = upper.CL),
+                width = 0.25, size = 0.25, color = "gray33") +
+  geom_point(size = 2.5, show.legend = FALSE,
+             color = "black") +
+  geom_smooth(method = "lm", se = TRUE,
+              formula =  'y ~ x + I(x^2)',
+              size = 0.5) +
+  scale_y_continuous(limits = c(7400, 8400),
+                     breaks = seq(7400, 8600, 200),
+                     expand = expansion(mult = 0, add = 0)) +
+  scale_x_continuous(breaks = seq(1, 12, 1)) +
+  theme_classic(base_family = "Times New Roman") +
+  labs(x = "Mês",
+       y = "Produção de leite (Kg/animal/lactação)") + 
+  geom_text(data = model.mes.res,
+            mapping = aes(x = 6, y = -Inf,
+                          label = model),
+            vjust = -2,
+            family = "Times New Roman",
+            parse = TRUE) +
+  geom_text(data = model.mes.res,
+            mapping = aes(x = 6, y = -Inf,
+                          label = paste(r2, p_valor)),
+            vjust = -1,
+            family = "Times New Roman",
+            parse = TRUE) +
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.title.x = element_text(size = 10,
+                                    margin = margin(t = 5, # top
+                                                    r = 0, # right 
+                                                    b = 0, # bottom
+                                                    l = 0)),
+        axis.title.y = element_text(size = 10,
+                                    margin = margin(t = 0, # top
+                                                    r = 10, # right 
+                                                    b = 0, # bottom
+                                                    l = 0)))
+
+ggsave(filename = paste(Sys.Date(), "Mês.jpeg", sep = "_"),
+       units = "cm",
+       width = 15,
+       height = 9,
+       dpi = 700)
+
+
+# Paridade
+emmeans(model.leite1.ar1cor, ~ ordem.parto.stats)
+
+multcomp::cld(emmeans(model.leite1.ar1cor, ~ ordem.parto.stats),
+              alpha = 0.05,
+              Letters = letters,
+              adjust = "tukey")
+
+ggplot(emmeans(model.leite1.ar1cor, ~ ordem.parto.stats) %>% 
+         as.data.frame() %>% 
+         mutate(labels = c("e", "c", "a", "b", "c", "d")), 
+       aes(x = ordem.parto.stats,
+           y = emmean)) +
+  geom_errorbar(aes(ymin = lower.CL,
+                    ymax = upper.CL),
+                width = 0.25, size = 0.25, color = "gray33") +
+  geom_point(size = 2.5, show.legend = FALSE,
+             color = "black") +
+  scale_y_continuous(limits = c(7000, 8800),
+                     breaks = seq(7000, 8800, 300),
+                     expand = expansion(mult = 0, add = 0)) +
+  geom_text(aes(label = labels,
+                y = upper.CL),
+            vjust = -1.5, color = "black",
+            family = "Times New Roman", size = 3.3) +
+  theme_classic(base_family = "Times New Roman") +
+  labs(x = "Paridade",
+       y = "Produção de leite (Kg/animal/lactação)") + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.title.x = element_text(size = 10,
+                                    margin = margin(t = 5, # top
+                                                    r = 0, # right 
+                                                    b = 0, # bottom
+                                                    l = 0)),
+        axis.title.y = element_text(size = 10,
+                                    margin = margin(t = 0, # top
+                                                    r = 10, # right 
+                                                    b = 0, # bottom
+                                                    l = 0)))
+  
+ggsave(filename = paste(Sys.Date(), "Paridade.jpeg", sep = "_"),
+       units = "cm",
+       width = 12,
+       height = 9,
+       dpi = 700)
+
+
